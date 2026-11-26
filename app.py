@@ -62,18 +62,54 @@ except FileNotFoundError:
     st.stop()
 
 
-# --- 4. Detección dinámica de un modelo de chat activo en Groq ---
+# --- 4. Detección dinámica de modelos de chat activos en Groq ---
+# Palabras que identifican modelos que NO son de chat (voz, transcripción, moderación, embeddings)
+NO_CHAT = ["whisper", "guard", "tts", "playai", "embed", "orpheus", "canopylabs", "distil", "prompt-guard"]
+# Familias de chat preferidas, en orden de prioridad
+PREFERIDOS = ["llama", "gpt-oss", "qwen", "kimi", "gemma", "mistral", "deepseek"]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def detectar_modelo_groq(api_key):
+def detectar_modelos_groq(api_key):
+    """Devuelve los modelos de chat activos, ordenados por preferencia."""
     client = Groq(api_key=api_key)
-    modelos_activos = [
+    activos = [
         m.id
         for m in client.models.list().data
-        if not any(x in m.id.lower() for x in ["whisper", "guard", "tts", "playai", "embed"])
+        if not any(x in m.id.lower() for x in NO_CHAT)
     ]
-    if not modelos_activos:
+    if not activos:
         raise RuntimeError("No hay modelos de texto disponibles en tu cuenta de Groq.")
-    return next((m for m in modelos_activos if "llama" in m.lower()), modelos_activos[0])
+
+    def prioridad(modelo_id):
+        for i, familia in enumerate(PREFERIDOS):
+            if familia in modelo_id.lower():
+                return i
+        return len(PREFERIDOS)
+
+    return sorted(activos, key=prioridad)
+
+
+def generar_con_groq(api_key, mensajes):
+    """Prueba los modelos en orden; si uno no admite chat, pasa al siguiente."""
+    client = Groq(api_key=api_key)
+    ultimo_error = None
+    for modelo_id in detectar_modelos_groq(api_key):
+        try:
+            respuesta = client.chat.completions.create(
+                model=modelo_id,
+                messages=mensajes,
+                temperature=0.4,
+                max_tokens=1024,
+            )
+            return modelo_id, respuesta.choices[0].message.content
+        except Exception as e:
+            texto = str(e).lower()
+            if "does not support chat" in texto or "model_not_found" in texto or "decommissioned" in texto:
+                ultimo_error = e
+                continue  # este modelo no sirve para chat: probar el siguiente
+            raise  # clave inválida, límite de peticiones, etc.
+    raise RuntimeError(f"Ningún modelo disponible admitió chat. Último error: {ultimo_error}")
 
 
 # --- 5. Interfaz: encabezado y controles laterales ---
@@ -176,19 +212,15 @@ Usa exactamente esta estructura:
     else:
         try:
             with st.spinner("Generando con Groq..."):
-                modelo_groq = detectar_modelo_groq(api_key)
-                client = Groq(api_key=api_key)
-                respuesta = client.chat.completions.create(
-                    model=modelo_groq,
-                    messages=[
+                modelo_groq, texto = generar_con_groq(
+                    api_key,
+                    [
                         {"role": "system", "content": prompt_sistema},
                         {"role": "user", "content": prompt_usuario},
                     ],
-                    temperature=0.4,
-                    max_tokens=1024,
                 )
             st.caption(f"⚡ Generado con el modelo: `{modelo_groq}`")
-            st.markdown(respuesta.choices[0].message.content)
+            st.markdown(texto)
         except Exception as e:
             # Resiliencia: si la API falla (clave inválida, límite de peticiones, sin red),
             # la app no colapsa y el diagnóstico de ML sigue visible.
